@@ -24,10 +24,10 @@ def parse_args():
     parser.add_argument(
         '--repeat-num',
         type=int,
-        default=1,
+        default=5,
         help='number of repeat times of measurement for averaging the results')
     parser.add_argument(
-        '--max-iter', type=int, default=2000, help='num of max iter')
+        '--max-iter', type=int, default=1, help='num of max iter')
     parser.add_argument(
         '--log-interval', type=int, default=50, help='interval of logging')
     parser.add_argument(
@@ -86,7 +86,7 @@ def measure_inference_speed(cfg, checkpoint, max_iter, log_interval,
     model.eval()
 
     # the first several iterations may be very slow so skip them
-    num_warmup = 5
+    num_warmup = 0
     pure_inf_time = 0
     fps = 0
 

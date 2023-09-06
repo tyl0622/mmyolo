@@ -4,6 +4,8 @@ from typing import List, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from mmengine import MessageHub
 from mmcv.cnn import ConvModule
 from mmdet.models.utils import multi_apply
 from mmdet.utils import (ConfigType, OptConfigType, OptInstanceList,
@@ -179,6 +181,174 @@ class YOLOv8HeadModule(BaseModule):
         else:
             return cls_logit, bbox_preds
 
+class ESEConv(nn.Module):
+    def __init__(self, feat_channels, norm_cfg, act_cfg):
+        super().__init__()
+        self.fc = nn.Conv2d(feat_channels, feat_channels, 1)
+        self.conv = ConvModule(in_channels=feat_channels,
+                               out_channels=feat_channels,
+                               kernel_size=1,
+                               norm_cfg=norm_cfg,
+                               act_cfg=act_cfg)
+        
+    def forward(self, feat, avg_feat):
+        weight = F.sigmoid(self.fc(avg_feat))
+        return self.conv(feat * weight)
+    
+@MODELS.register_module()
+class YOLOv8HeadModuleCustom(BaseModule):
+    """YOLOv8HeadModule head module used in `YOLOv8`.
+
+    Args:
+        num_classes (int): Number of categories excluding the background
+            category.
+        in_channels (Union[int, Sequence]): Number of channels in the input
+            feature map.
+        widen_factor (float): Width multiplier, multiply number of
+            channels in each layer by this amount. Defaults to 1.0.
+        num_base_priors (int): The number of priors (points) at a point
+            on the feature grid.
+        featmap_strides (Sequence[int]): Downsample factor of each feature map.
+             Defaults to [8, 16, 32].
+        reg_max (int): Max value of integral set :math: ``{0, ..., reg_max-1}``
+            in QFL setting. Defaults to 16.
+        norm_cfg (:obj:`ConfigDict` or dict): Config dict for normalization
+            layer. Defaults to dict(type='BN', momentum=0.03, eps=0.001).
+        act_cfg (:obj:`ConfigDict` or dict): Config dict for activation layer.
+            Defaults to None.
+        init_cfg (:obj:`ConfigDict` or list[:obj:`ConfigDict`] or dict or
+            list[dict], optional): Initialization config dict.
+            Defaults to None.
+    """
+
+    def __init__(self,
+                 num_classes: int,
+                 in_channels: Union[int, Sequence],
+                 widen_factor: float = 1.0,
+                 num_base_priors: int = 1,
+                 featmap_strides: Sequence[int] = (8, 16, 32),
+                 reg_max: int = 16,
+                 norm_cfg: ConfigType = dict(
+                     type='BN', momentum=0.03, eps=0.001),
+                 act_cfg: ConfigType = dict(type='SiLU', inplace=True),
+                 init_cfg: OptMultiConfig = None):
+        super().__init__(init_cfg=init_cfg)
+        self.num_classes = num_classes
+        self.featmap_strides = featmap_strides
+        self.num_levels = len(self.featmap_strides)
+        self.num_base_priors = num_base_priors
+        self.norm_cfg = norm_cfg
+        self.act_cfg = act_cfg
+        self.in_channels = in_channels
+        self.reg_max = reg_max
+
+        in_channels = []
+        for channel in self.in_channels:
+            channel = make_divisible(channel, widen_factor)
+            in_channels.append(channel)
+        self.in_channels = in_channels
+
+        self._init_layers()
+
+    def init_weights(self, prior_prob=0.01):
+        """Initialize the weight and bias of PPYOLOE head."""
+        super().init_weights()
+        for reg_pred, cls_pred, stride in zip(self.reg_preds, self.cls_preds,
+                                              self.featmap_strides):
+            reg_pred[-1].bias.data[:] = 1.0  # box
+            # cls (.01 objects, 80 classes, 640 img)
+            cls_pred[-1].bias.data[:self.num_classes] = math.log(
+                5 / self.num_classes / (640 / stride)**2)
+
+    def _init_layers(self):
+        """initialize conv layers in YOLOv8 head."""
+        # Init decouple head
+        self.stem_cls = nn.ModuleList()
+        self.stem_reg = nn.ModuleList()
+
+        self.cls_preds = nn.ModuleList()
+        self.reg_preds = nn.ModuleList()
+
+        reg_out_channels = max(
+            (16, self.in_channels[0] // 4, self.reg_max * 4))
+        cls_out_channels = max(self.in_channels[0], self.num_classes)
+
+        for i in range(self.num_levels):
+            self.stem_reg.append(ESEConv(self.in_channels[i], norm_cfg=self.norm_cfg, act_cfg=self.act_cfg))
+            self.stem_cls.append(ESEConv(self.in_channels[i], norm_cfg=self.norm_cfg, act_cfg=self.act_cfg))
+
+        for i in range(self.num_levels):
+            self.reg_preds.append(
+                nn.Sequential(
+                    ConvModule(
+                        in_channels=self.in_channels[i],
+                        out_channels=reg_out_channels,
+                        kernel_size=3,
+                        stride=1,
+                        padding=1,
+                        norm_cfg=self.norm_cfg,
+                        act_cfg=self.act_cfg),
+                    nn.Conv2d(
+                        in_channels=reg_out_channels,
+                        out_channels=4 * self.reg_max,
+                        kernel_size=1)))
+            self.cls_preds.append(
+                nn.Sequential(
+                    ConvModule(
+                        in_channels=self.in_channels[i],
+                        out_channels=cls_out_channels,
+                        kernel_size=3,
+                        stride=1,
+                        padding=1,
+                        norm_cfg=self.norm_cfg,
+                        act_cfg=self.act_cfg),
+                    nn.Conv2d(
+                        in_channels=cls_out_channels,
+                        out_channels=self.num_classes,
+                        kernel_size=1)))
+
+        proj = torch.arange(self.reg_max, dtype=torch.float)
+        self.register_buffer('proj', proj, persistent=False)
+
+    def forward(self, x: Tuple[Tensor]) -> Tuple[List]:
+        """Forward features from the upstream network.
+
+        Args:
+            x (Tuple[Tensor]): Features from the upstream network, each is
+                a 4D-tensor.
+        Returns:
+            Tuple[List]: A tuple of multi-level classification scores, bbox
+            predictions
+        """
+        assert len(x) == self.num_levels
+        return multi_apply(self.forward_single, x, self.cls_preds,
+                           self.reg_preds, self.stem_cls, self.stem_reg)
+
+    def forward_single(self, x: torch.Tensor, cls_pred: nn.ModuleList,
+                       reg_pred: nn.ModuleList, stem_cls: nn.ModuleList,
+                       stem_reg: nn.ModuleList) -> Tuple:
+        """Forward feature of a single scale level."""
+        b, _, h, w = x.shape
+        avg_feat = F.adaptive_avg_pool2d(x, (1, 1))
+        cls_logit = cls_pred(stem_cls(x, avg_feat))
+        bbox_dist_preds = reg_pred(stem_reg(x, avg_feat))
+        if self.reg_max > 1:
+            bbox_dist_preds = bbox_dist_preds.reshape(
+                [-1, 4, self.reg_max, h * w]).permute(0, 3, 1, 2)
+
+            # TODO: The get_flops script cannot handle the situation of
+            #  matmul, and needs to be fixed later
+            # bbox_preds = bbox_dist_preds.softmax(3).matmul(self.proj)
+            bbox_preds = bbox_dist_preds.softmax(3).matmul(
+                self.proj.view([-1, 1])).squeeze(-1)
+            bbox_preds = bbox_preds.transpose(1, 2).reshape(b, -1, h, w)
+        else:
+            bbox_preds = bbox_dist_preds
+        if self.training:
+            return cls_logit, bbox_preds, bbox_dist_preds
+        else:
+            return cls_logit, bbox_preds
+        
 
 @MODELS.register_module()
 class YOLOv8Head(YOLOv5Head):
@@ -248,6 +418,8 @@ class YOLOv8Head(YOLOv5Head):
         The special_init function is designed to deal with this situation.
         """
         if self.train_cfg:
+            self.initial_epoch = self.train_cfg['initial_epoch']
+            self.initial_assigner = TASK_UTILS.build(self.train_cfg.initial_assigner)
             self.assigner = TASK_UTILS.build(self.train_cfg.assigner)
 
             # Add common attributes to reduce calculation
@@ -288,6 +460,11 @@ class YOLOv8Head(YOLOv5Head):
         Returns:
             dict[str, Tensor]: A dictionary of losses.
         """
+
+        # get epoch information
+        message_hub = MessageHub.get_current_instance()
+        current_epoch = message_hub.get_info('epoch')
+
         num_imgs = len(batch_img_metas)
 
         current_featmap_sizes = [
@@ -312,7 +489,7 @@ class YOLOv8Head(YOLOv5Head):
         gt_info = gt_instances_preprocess(batch_gt_instances, num_imgs)
         gt_labels = gt_info[:, :, :1]
         gt_bboxes = gt_info[:, :, 1:]  # xyxy
-        pad_bbox_flag = (gt_bboxes.sum(-1, keepdim=True) > 0).float()
+        pad_bbox_flag = (gt_bboxes.sum(-1, keepdim=True) > 0).float() #为了每张图的bboxes数这一维一致, 少的图像对应的bboxes补零, 这里pad为0的就是补的
 
         # pred info
         flatten_cls_preds = [
@@ -337,16 +514,26 @@ class YOLOv8Head(YOLOv5Head):
             self.flatten_priors_train[..., :2], flatten_pred_bboxes,
             self.stride_tensor[..., 0])
 
-        assigned_result = self.assigner(
-            (flatten_pred_bboxes.detach()).type(gt_bboxes.dtype),
-            flatten_cls_preds.detach().sigmoid(), self.flatten_priors_train,
-            gt_labels, gt_bboxes, pad_bbox_flag)
+        if current_epoch < self.initial_epoch:
+            assigned_result = self.initial_assigner(
+                flatten_pred_bboxes.detach(), self.flatten_priors_train,
+                self.num_level_priors, gt_labels, gt_bboxes, pad_bbox_flag)
+        else:
+            assigned_result = self.assigner(
+                (flatten_pred_bboxes.detach()).type(gt_bboxes.dtype),
+                flatten_cls_preds.detach().sigmoid(), self.flatten_priors_train,
+                gt_labels, gt_bboxes, pad_bbox_flag)
 
         assigned_bboxes = assigned_result['assigned_bboxes']
         assigned_scores = assigned_result['assigned_scores']
         fg_mask_pre_prior = assigned_result['fg_mask_pre_prior']
 
         assigned_scores_sum = assigned_scores.sum().clamp(min=1)
+
+        # output_tensor = {'assigned_bboxes': assigned_bboxes, 'assigned_scores': assigned_scores, 'fg_mask_pre_prior': fg_mask_pre_prior, \
+        #                  'flatten_pred_bboxes': flatten_pred_bboxes, 'flatten_priors_train': self.flatten_priors_train, \
+        #                  'gt_bboxes': gt_bboxes, 'pad_bbox_flag': pad_bbox_flag}
+        # torch.save(output_tensor, '/root/mmyolo/work_dirs/outputs/output_tensor.pt')
 
         loss_cls = self.loss_cls(flatten_cls_preds, assigned_scores).sum()
         loss_cls /= assigned_scores_sum

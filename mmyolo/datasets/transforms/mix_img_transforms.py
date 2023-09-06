@@ -310,7 +310,7 @@ class Mosaic(BaseMixImageTransform):
         Args:
             results (dict): Result dict.
 
-        Returns:
+        Returns:   
             results (dict): Updated result dict.
         """
         assert 'mix_results' in results
@@ -321,7 +321,7 @@ class Mosaic(BaseMixImageTransform):
         with_mask = True if 'gt_masks' in results else False
         # self.img_scale is wh format
         img_scale_w, img_scale_h = self.img_scale
-
+        # 单通道图片还是三通道图片
         if len(results['img'].shape) == 3:
             mosaic_img = np.full(
                 (int(img_scale_h * 2), int(img_scale_w * 2), 3),
@@ -1148,3 +1148,103 @@ class YOLOXMixUp(BaseMixImageTransform):
         repr_str += f'max_refetch={self.max_refetch}, '
         repr_str += f'bbox_clip_border={self.bbox_clip_border})'
         return repr_str
+
+@TRANSFORMS.register_module()
+class Fill(BaseMixImageTransform):
+    def __init__(self,
+                 img_scale: Tuple[int, int] = (640, 640),
+                 bbox_clip_border: bool = True,
+                 pad_val: float = 114.0,
+                 pre_transform: Sequence[dict] = None,
+                 prob: float = 1.0,
+                 use_cached: bool = False,
+                 max_cached_images: int = 40,
+                 random_pop: bool = True,
+                 max_refetch: int = 15):
+        super().__init__(
+            pre_transform=pre_transform,
+            prob=prob,
+            use_cached=use_cached,
+            max_cached_images=max_cached_images,
+            random_pop=random_pop,
+            max_refetch=max_refetch)
+        
+        self.img_scale = img_scale
+        self.bbox_clip_border = bbox_clip_border
+        self.pad_val = pad_val
+
+    def get_indexes(self, dataset: Union[BaseDataset, list]) -> list:
+        indexes = [random.randint(0, len(dataset)) for _ in range(7)]
+        return indexes
+    
+    def mix_img_transform(self, results: dict) -> dict:
+        mix_bboxes = []
+        mix_bboxes_labels = []
+        mix_ignore_flags = []
+
+        img_scale_w, img_scale_h = self.img_scale
+        if len(results['img'].shape) == 3:
+            mix_img = np.full((int(img_scale_h), int(img_scale_w), 3), self.pad_val, dtype=results['img'].dtype)
+        else:
+            mix_img = np.full((int(img_scale_h), int(img_scale_w)), self.pad_val, dtype=results['img'].dtype)
+
+        loc_strs = [f'{i}' for i in range(7)]
+        for i, loc in enumerate(loc_strs):
+            if loc == '0': 
+                results_patch = results
+            else:
+                results_patch = results['mix_results'][i - 1]
+
+            img_i = results_patch['img']
+            h_i, w_i = img_i.shape[:2]
+            scale_ratio_i = min(img_scale_h / h_i, img_scale_w / w_i)
+            img_i = mmcv.imresize(img_i, (int(w_i * scale_ratio_i), int(h_i * scale_ratio_i)))
+
+            # h_i和w_i是缩放前的原始图像大小
+            # 函数传入img_i.shape是缩放后的图像大小
+            paste_coord, crop_coord = self._mix_combine(loc, img_i.shape[:2][::-1])
+            x1_p, y1_p, x2_p, y2_p = paste_coord
+            x1_c, y1_c, x2_c, y2_c = crop_coord
+
+            mix_img[y1_p:y2_p, x1_p:x2_p] = img_i[y1_c:y2_c, x1_c:x2_c]
+
+            gt_bboxes_i = results_patch['gt_bboxes']
+            gt_bboxes_labels_i = results_patch['gt_bboxes_labels']
+            gt_ignore_flags_i = results_patch['gt_ignore_flags']
+
+            # 对齐bbox到新的图像坐标系
+            padw = x1_p - x1_c
+            padh = y1_p - y1_c
+            gt_bboxes_i.rescale_([scale_ratio_i, scale_ratio_i])
+            gt_bboxes_i.translate_([padw, padh])
+            mix_bboxes.append(gt_bboxes_i)
+            mix_bboxes_labels.append(gt_bboxes_labels_i)
+            mix_ignore_flags.append(gt_ignore_flags_i)
+
+        mix_bboxes = mix_bboxes[0].cat(mix_bboxes, 0)
+        mix_bboxes_labels = np.concatenate(mix_bboxes_labels, 0)
+        mix_ignore_flags = np.concatenate(mix_ignore_flags, 0)
+
+        if self.bbox_clip_border:
+            mix_bboxes.clip_([img_scale_h, img_scale_w])
+
+        results['img'] = mix_img
+        results['img_shape'] = mix_img.shape
+        results['gt_bboxes'] = mix_bboxes
+        results['gt_bboxes_labels'] = mix_bboxes_labels
+        results['gt_ignore_flags'] = mix_ignore_flags
+
+        return results
+
+
+    def _mix_combine(self, loc: str, img_shape_wh: Sequence[int]) -> Tuple[Tuple[int], Tuple[int]]:
+        if loc == '0':
+            x1, y1, x2, y2 = 0, 0, img_shape_wh[0], img_shape_wh[1]
+        else:
+            x1, y1, x2, y2 = (img_shape_wh[0] + 1) * int(loc), \
+            0, img_shape_wh[0] + (img_shape_wh[0] + 1) * int(loc), img_shape_wh[1]
+        
+        crop_coord = img_shape_wh[0] - (x2 - x1), img_shape_wh[1] - (y2 - y1), \
+            img_shape_wh[0], img_shape_wh[1]
+        paste_coord = x1, y1, x2, y2
+        return paste_coord, crop_coord

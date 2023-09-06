@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=3 python demo/featmap_vis_demo.py /root/mmyolo/data/coco3/val2017/3.jpg /root/mmyolo/work_dirs/yolo_20230831/20230831_144152/vis_data/config.py /root/mmyolo/work_dirs/yolo_20230831/20230831_144152/best_coco_bbox_mAP_50_epoch_25.pth --channel-reduction squeeze_mean

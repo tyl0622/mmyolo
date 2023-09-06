@@ -12,6 +12,8 @@ from ..layers import CSPLayerWithTwoConv, SPPFBottleneck
 from ..utils import make_divisible, make_round
 from .base_backbone import BaseBackbone
 
+from mmdet.models.layers.positional_encoding import SinePositionalEncoding
+from mmdet.models.layers.transformer import DetrTransformerEncoder
 
 @MODELS.register_module()
 class YOLOv5CSPDarknet(BaseBackbone):
@@ -260,14 +262,26 @@ class YOLOv8CSPDarknet(BaseBackbone):
         out_channels = make_divisible(out_channels, self.widen_factor)
         num_blocks = make_round(num_blocks, self.deepen_factor)
         stage = []
+        # 下采样stride conv替换成space2depth
+        stage.append(space2depth())
         conv_layer = ConvModule(
-            in_channels,
+            4*in_channels,
             out_channels,
             kernel_size=3,
-            stride=2,
+            stride=1,
             padding=1,
             norm_cfg=self.norm_cfg,
             act_cfg=self.act_cfg)
+
+        # conv_layer = ConvModule(
+        #     in_channels,
+        #     out_channels,
+        #     kernel_size=3,
+        #     stride=2,
+        #     padding=1,
+        #     norm_cfg=self.norm_cfg,
+        #     act_cfg=self.act_cfg)
+
         stage.append(conv_layer)
         csp_layer = CSPLayerWithTwoConv(
             out_channels,
@@ -425,3 +439,197 @@ class YOLOXCSPDarknet(BaseBackbone):
             act_cfg=self.act_cfg)
         stage.append(csp_layer)
         return stage
+
+class space2depth(nn.Module):
+    def __init__(self, dimension=1):
+        super().__init__()
+        self.d = dimension
+
+    def forward(self, x):
+        return torch.cat([x[..., ::2, ::2], x[..., ::2, 1::2], x[..., 1::2, ::2], x[..., 1::2, 1::2]], 1)
+        
+@MODELS.register_module()
+class YOLOv8CSPDarknetCustom(BaseBackbone):
+    """CSP-Darknet backbone used in YOLOv8.
+
+    Args:
+        arch (str): Architecture of CSP-Darknet, from {P5}.
+            Defaults to P5.
+        last_stage_out_channels (int): Final layer output channel.
+            Defaults to 1024.
+        plugins (list[dict]): List of plugins for stages, each dict contains:
+            - cfg (dict, required): Cfg dict to build plugin.
+            - stages (tuple[bool], optional): Stages to apply plugin, length
+              should be same as 'num_stages'.
+        deepen_factor (float): Depth multiplier, multiply number of
+            blocks in CSP layer by this amount. Defaults to 1.0.
+        widen_factor (float): Width multiplier, multiply number of
+            channels in each layer by this amount. Defaults to 1.0.
+        input_channels (int): Number of input image channels. Defaults to: 3.
+        out_indices (Tuple[int]): Output from which stages.
+            Defaults to (2, 3, 4).
+        frozen_stages (int): Stages to be frozen (stop grad and set eval
+            mode). -1 means not freezing any parameters. Defaults to -1.
+        norm_cfg (dict): Dictionary to construct and config norm layer.
+            Defaults to dict(type='BN', requires_grad=True).
+        act_cfg (dict): Config dict for activation layer.
+            Defaults to dict(type='SiLU', inplace=True).
+        norm_eval (bool): Whether to set norm layers to eval mode, namely,
+            freeze running stats (mean and var). Note: Effect on Batch Norm
+            and its variants only. Defaults to False.
+        init_cfg (Union[dict,list[dict]], optional): Initialization config
+            dict. Defaults to None.
+
+    Example:
+        >>> from mmyolo.models import YOLOv8CSPDarknet
+        >>> import torch
+        >>> model = YOLOv8CSPDarknet()
+        >>> model.eval()
+        >>> inputs = torch.rand(1, 3, 416, 416)
+        >>> level_outputs = model(inputs)
+        >>> for level_out in level_outputs:
+        ...     print(tuple(level_out.shape))
+        ...
+        (1, 256, 52, 52)
+        (1, 512, 26, 26)
+        (1, 1024, 13, 13)
+    """
+    # From left to right:
+    # in_channels, out_channels, num_blocks, add_identity, use_spp
+    # the final out_channels will be set according to the param.
+    arch_settings = {
+        'P5': [[64, 128, 3, True, False], [128, 256, 6, True, False],
+               [256, 512, 6, True, False], [512, None, 3, True, False]],
+    }
+
+    def __init__(self,
+                 arch: str = 'P5',
+                 last_stage_out_channels: int = 1024,
+                 plugins: Union[dict, List[dict]] = None,
+                 deepen_factor: float = 1.0,
+                 widen_factor: float = 1.0,
+                 input_channels: int = 3,
+                 out_indices: Tuple[int] = (2, 3, 4),
+                 frozen_stages: int = -1,
+                 norm_cfg: ConfigType = dict(
+                     type='BN', momentum=0.03, eps=0.001),
+                 act_cfg: ConfigType = dict(type='SiLU', inplace=True),
+                 norm_eval: bool = False,
+                 init_cfg: OptMultiConfig = None):
+        self.arch_settings[arch][-1][1] = last_stage_out_channels
+        super().__init__(
+            self.arch_settings[arch],
+            deepen_factor,
+            widen_factor,
+            input_channels=input_channels,
+            out_indices=out_indices,
+            plugins=plugins,
+            frozen_stages=frozen_stages,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg,
+            norm_eval=norm_eval,
+            init_cfg=init_cfg)
+
+    def build_stem_layer(self) -> nn.Module:
+        """Build a stem layer."""
+        return ConvModule(
+            self.input_channels,
+            make_divisible(self.arch_setting[0][0], self.widen_factor),
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            norm_cfg=self.norm_cfg,
+            act_cfg=self.act_cfg)
+
+    def build_stage_layer(self, stage_idx: int, setting: list) -> list:
+        """Build a stage layer.
+
+        Args:
+            stage_idx (int): The index of a stage layer.
+            setting (list): The architecture setting of a stage layer.
+        """
+        in_channels, out_channels, num_blocks, add_identity, use_spp = setting
+
+        in_channels = make_divisible(in_channels, self.widen_factor)
+        out_channels = make_divisible(out_channels, self.widen_factor)
+        num_blocks = make_round(num_blocks, self.deepen_factor)
+        stage = []
+        conv_layer = ConvModule(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            norm_cfg=self.norm_cfg,
+            act_cfg=self.act_cfg)
+        stage.append(conv_layer)
+        csp_layer = CSPLayerWithTwoConv(
+            out_channels,
+            out_channels,
+            num_blocks=num_blocks,
+            add_identity=add_identity,
+            norm_cfg=self.norm_cfg,
+            act_cfg=self.act_cfg)
+        stage.append(csp_layer)
+        if use_spp:
+            spp = SPPFBottleneck(
+                out_channels,
+                out_channels,
+                kernel_sizes=5,
+                norm_cfg=self.norm_cfg,
+                act_cfg=self.act_cfg)
+            stage.append(spp)
+        
+        layer_cfg=dict(  # DetrTransformerEncoderLayer
+            self_attn_cfg=dict(  # MultiheadAttention
+                embed_dims=256,
+                num_heads=8,
+                dropout=0.1,
+                batch_first=True),
+            ffn_cfg=dict(
+                embed_dims=256,
+                feedforward_channels=256,
+                num_fcs=2,
+                ffn_drop=0.1,
+                act_cfg=dict(type='ReLU', inplace=True)))
+        self.pos_emd = SinePositionalEncoding(num_feats=128, normalize=True)
+        self.trans_encoder = DetrTransformerEncoder(num_layers=6, layer_cfg=layer_cfg)
+
+        # init trandsformer
+        for p in self.trans_encoder.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+        return stage
+
+    def init_weights(self):
+        """Initialize the parameters."""
+        if self.init_cfg is None:
+            for m in self.modules():
+                if isinstance(m, torch.nn.Conv2d):
+                    # In order to be consistent with the source code,
+                    # reset the Conv2d initialization parameters
+                    m.reset_parameters()
+        else:
+            super().init_weights()
+
+    def forward(self, x: torch.Tensor) -> tuple:
+        """Forward batch_inputs from the data_preprocessor."""
+        outs = []
+        for i, layer_name in enumerate(self.layers):
+            layer = getattr(self, layer_name)
+            x = layer(x)
+            if i in self.out_indices:
+                outs.append(x)
+
+        last_feat = outs[-1]
+        n, c, h, w = last_feat.shape
+        mask = last_feat.new_zeros((n, h, w)).to(torch.bool)
+        # [bs, c, h, w] --> [bs, h*w, c]
+        flatten_feat = last_feat.flatten(2).permute(0, 2 ,1)
+        pos_embed = self.pos_emd(mask).flatten(2).permute(0, 2, 1)
+        mask = mask.view(n, -1)
+        embed = self.trans_encoder(flatten_feat, pos_embed, mask)
+        last_feat_embed = embed.permute(0, 2, 1).reshape(n, c, h, w)
+        outs[-1] = last_feat_embed
+
+        return tuple(outs)
